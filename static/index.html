@@ -22,7 +22,9 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/trace?code=&lt;批次编号&gt;</pre>
+  <p>批次检测按样本登记（register_sample / record_result / recheck）；有待检或阳性样本时批次停在“待处置”，全部阴性复核后方可放行。</p>
 </main>
 <script>
 async function checkHealth() {

@@ -1,8 +1,8 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .domain import NotFoundError
+from .rules import STATUS_LABELS, RuleEngine, batch_hold_reasons
 
 
 class DomainService:
@@ -13,6 +13,17 @@ class DomainService:
 
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
+
+    def _present(self, entity):
+        if entity is None:
+            return None
+        item = dict(entity)
+        item["status_label"] = STATUS_LABELS.get(entity["status"], entity["status"])
+        if entity["kind"] == "consignment":
+            reasons = batch_hold_reasons(entity["data"])
+            item["data"] = dict(entity["data"])
+            item["data"]["hold_reasons"] = reasons
+        return item
 
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
@@ -35,7 +46,7 @@ class DomainService:
         self.audit.record(entity_id, actor, "create", None, status, {"kind": kind})
         if idempotency_key:
             self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
-        return entity
+        return self._present(entity)
 
     def transition(self, actor, entity_id, action, data=None, expected_version=None):
         entity = self.repository.get_entity(entity_id)
@@ -56,18 +67,39 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
-        return updated
+        return self._present(updated)
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
-        return entity
+        return self._present(entity)
 
     def list(self, kind=None, status=None):
         if kind:
             kind = self.rules.normalize_kind(kind)
-        return self.repository.list_entities(kind=kind, status=status)
+        return [self._present(item) for item in self.repository.list_entities(kind=kind, status=status)]
+
+    def trace_consignment(self, code=None, entity_id=None):
+        """按批次编号或ID追溯：批次放行后退回待处置，记录仍按编号可查。"""
+        entity = None
+        if entity_id:
+            entity = self.repository.get_entity(entity_id)
+        elif code:
+            rows = self.repository.find_entities("consignment", "code", code)
+            entity = rows[0] if rows else None
+        if not entity:
+            raise NotFoundError("consignment not found: " + str(code or entity_id))
+        downstream = self.repository.list_entities(kind="facility")
+        facilities = [
+            item
+            for item in downstream
+            if entity["id"] in (item["data"].get("consignment_ids") or [])
+        ]
+        return {
+            "consignment": self._present(entity),
+            "traced_facilities": [self._present(item) for item in facilities],
+        }
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

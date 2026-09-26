@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.domain import Actor, ConflictError, PermissionDenied
+from src.domain import Actor, ConflictError, PermissionDenied, ValidationError
 from src.repository import SQLiteRepository
 from src.rules import RuleEngine
 from src.service import DomainService
@@ -19,43 +19,65 @@ class FailureTest(unittest.TestCase):
 
     def test_permission_denied(self):
         entity = self.service.create(
-            Actor("admin", "admin"), 'consignment', {'code': 'C-9', 'origin': 'A', 'destination': 'B'}
+            Actor("admin", "admin"),
+            "consignment",
+            {"code": "C-9", "origin": "A", "destination": "B"},
         )
         with self.assertRaises(PermissionDenied):
             self.service.transition(
                 Actor("viewer", "viewer"),
                 entity["id"],
-                'inspect',
-                {'inspector': 'I-1', 'inspection_result': 'clean'},
+                "register_sample",
+                {"sample_no": "S-1", "sampling_point": "dock", "tester": "L-1"},
             )
 
     def test_version_conflict(self):
         entity = self.service.create(
-            Actor("admin", "admin"), 'consignment', {'code': 'C-9', 'origin': 'A', 'destination': 'B'}
+            Actor("admin", "admin"),
+            "consignment",
+            {"code": "C-9", "origin": "A", "destination": "B"},
         )
         with self.assertRaises(ConflictError):
             self.service.transition(
                 Actor("admin", "admin"),
                 entity["id"],
-                'inspect',
-                {'inspector': 'I-1', 'inspection_result': 'clean'},
+                "register_sample",
+                {"sample_no": "S-1", "sampling_point": "dock", "tester": "L-1"},
                 expected_version=999,
             )
 
     def test_duplicate_idempotency_key_returns_same_entity(self):
         first = self.service.create(
             Actor("admin", "admin"),
-            'consignment',
-            {'code': 'C-9', 'origin': 'A', 'destination': 'B'},
+            "consignment",
+            {"code": "C-9", "origin": "A", "destination": "B"},
             idempotency_key="duplicate-check",
         )
         second = self.service.create(
             Actor("admin", "admin"),
-            'consignment',
-            {'code': 'C-9', 'origin': 'A', 'destination': 'B'},
+            "consignment",
+            {"code": "C-9", "origin": "A", "destination": "B"},
             idempotency_key="duplicate-check",
         )
         self.assertEqual(first["id"], second["id"])
+
+    def test_release_before_samples_rejected(self):
+        entity = self.service.create(
+            Actor("admin", "admin"),
+            "consignment",
+            {"code": "C-10", "origin": "A", "destination": "B"},
+        )
+        entity = self.service.transition(
+            Actor("I-1", "inspector"),
+            entity["id"],
+            "register_sample",
+            {"sample_no": "S-1", "sampling_point": "dock", "tester": "L-1"},
+        )
+        # 样本待检，批次停在待处置，放行被拒
+        with self.assertRaises(ValidationError):
+            self.service.transition(
+                Actor("Q-1", "quarantine"), entity["id"], "release", {}
+            )
 
 
 if __name__ == "__main__":

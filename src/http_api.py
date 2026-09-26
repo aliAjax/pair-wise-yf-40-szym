@@ -90,6 +90,15 @@ def create_handler(service, rules, static_dir):
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
+                    if parts[1] == "trace":
+                        query = parse_qs(parsed.query)
+                        code = query.get("code", [None])[0]
+                        entity_id = query.get("id", [None])[0]
+                        if not code and not entity_id:
+                            raise ValidationError("code or id is required")
+                        return self._send(
+                            200, service.trace_consignment(code=code, entity_id=entity_id)
+                        )
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)

@@ -26,6 +26,31 @@ python3 app.py --db ./data.db --port 8306
 
 - `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
 
+## 批次状态机与样本检测
+
+批次状态：`declared`（已申报）→ `pending_disposition`（待处置）→ `released`（已放行）；
+存在阳性样本可 `quarantine`（已隔离）→ `destroy`（已销毁）。
+
+检测不再以一次抽检结论为准，而是拆成批次下的多条样本记录：
+
+| 动作 | 角色 | 说明 |
+| --- | --- | --- |
+| `register_sample` | admin / inspector / lab | 登记样本号 `sample_no`、采样点 `sampling_point`、检测人 `tester`，可带初检 `conclusion`（默认 `pending`）。登记后批次进入待处置 |
+| `record_result` | admin / lab | 实验室补出初检结论（`negative` / `positive`），阳性会拦住放行 |
+| `recheck` | admin / lab | 复检/复核，`tester` 必须与初检检测人不是同一人；结论追加到该样本的 `rechecks` 历史 |
+| `release` | admin / quarantine | 全部样本初检阴性且复核阴性才允许放行 |
+| `quarantine` | admin / quarantine | 至少存在一条阳性样本才能隔离 |
+| `destroy` | admin / quarantine | 隔离后销毁 |
+
+规则：
+
+- 只要存在**待检**或**阳性**样本，批次停在 `pending_disposition`；实体响应的
+  `data.hold_reasons` 会逐条列出原因，尝试放行时错误信息同样列出原因。
+- 放行后复检改出阳性，批次自动重新进入 `pending_disposition`；放行记录保留在
+  `data.release_history`（历次放行的检测人与时间）。
+- 设施追溯按批次编号（`code`）或实体ID关联批次，批次状态回退后仍可查到。
+  另提供 `GET /api/trace?code=<批次编号>`（或 `?id=<实体ID>`）查询批次及其关联设施。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
@@ -33,6 +58,7 @@ python3 app.py --db ./data.db --port 8306
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/trace?code=<批次编号>`：按批次编号追溯批次与关联设施。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
