@@ -2,7 +2,12 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import (
+    HOLD_EXEMPT_STATUSES,
+    HOLD_STATUS,
+    RuleEngine,
+    consignment_hold_reasons,
+)
 
 
 class DomainService:
@@ -35,6 +40,8 @@ class DomainService:
         self.audit.record(entity_id, actor, "create", None, status, {"kind": kind})
         if idempotency_key:
             self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
+        if kind == "sample":
+            self._sync_consignment_hold(actor, entity["data"].get("consignment_id"))
         return entity
 
     def transition(self, actor, entity_id, action, data=None, expected_version=None):
@@ -56,7 +63,49 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if updated["kind"] == "sample":
+            self._sync_consignment_hold(actor, updated["data"].get("consignment_id"))
         return updated
+
+    def _sync_consignment_hold(self, actor, consignment_id):
+        if not consignment_id:
+            return
+        consignment = self.repository.get_entity(consignment_id)
+        if not consignment or consignment["kind"] != "consignment":
+            return
+        status = consignment["status"]
+        if status in HOLD_EXEMPT_STATUSES:
+            return
+        samples = self.repository.find_entities("sample", "consignment_id", consignment_id)
+        reasons = consignment_hold_reasons(samples)
+        data = dict(consignment["data"])
+        if reasons:
+            if status == HOLD_STATUS and data.get("hold_reasons") == reasons:
+                return
+            if status != HOLD_STATUS:
+                data["hold_return_status"] = status
+            data["hold_reasons"] = reasons
+            self.repository.update_entity(consignment_id, None, HOLD_STATUS, data)
+            self.audit.record(
+                consignment_id,
+                actor,
+                "hold",
+                status,
+                HOLD_STATUS,
+                {"reasons": reasons},
+            )
+        elif status == HOLD_STATUS:
+            target = data.pop("hold_return_status", None) or "inspected"
+            data["hold_reasons"] = []
+            self.repository.update_entity(consignment_id, None, target, data)
+            self.audit.record(
+                consignment_id,
+                actor,
+                "hold_cleared",
+                HOLD_STATUS,
+                target,
+                {},
+            )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

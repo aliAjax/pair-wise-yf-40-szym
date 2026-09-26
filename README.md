@@ -24,7 +24,15 @@ python3 app.py --db ./data.db --port 8306
 
 ## 核心对象
 
-- `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
+- `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点；`sample`：批次的实验室检测样本。
+
+## 样本检测与放行规则
+
+- 每个批次登记多份样本（`sample`），必填样本号、采样点、检测人；登记后样本为`pending`（待检）。
+- `test`记录初检结论（`negative`/`positive`）；`retest`记录复检结论，且复检人必须与上一检测人不同。
+- 只要批次下存在待检或阳性样本，批次自动进入`pending_disposal`（待处置），并在`hold_reasons`中列出原因；原因消除后自动回到原状态。
+- 只有全部样本复检为阴性才允许`release`；无样本、待检、阳性或未复检都会拦截放行。
+- 已放行批次若复检改出阳性，会自动重新进入`pending_disposal`；原放行记录保留在审计时间线中，设施追溯仍可按批次编号（`code`）查到该批货物。
 
 ## 主要接口
 

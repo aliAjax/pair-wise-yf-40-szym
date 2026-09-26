@@ -7,6 +7,10 @@ from .domain import (
     ValidationError,
 )
 
+SAMPLE_CONCLUSIONS = ("negative", "positive")
+HOLD_STATUS = "pending_disposal"
+HOLD_EXEMPT_STATUSES = ("quarantined", "destroyed")
+
 
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
@@ -20,11 +24,90 @@ def _validate_quarantine(actor, entity, data, lookup):
 
 
 def _validate_release(actor, entity, data, lookup):
-    if data.get("pest_found"):
-        raise ValidationError("pest-positive consignment cannot be released")
-    if data.get("treatment") not in ("none", "completed", "certified"):
-        raise ValidationError("release requires a valid treatment state")
+    samples = lookup("sample", "consignment_id", entity["id"]) if lookup else []
+    blockers = consignment_release_blockers(samples)
+    if blockers:
+        raise ValidationError("release blocked: " + "; ".join(blockers))
     return {"released_by": actor.user_id}
+
+
+def _validate_sample_create(actor, data, lookup):
+    consignment = _find_one(lookup, "consignment", "id", data.get("consignment_id"))
+    if not consignment:
+        raise ValidationError("unknown consignment: " + str(data.get("consignment_id")))
+    if consignment.get("status") in HOLD_EXEMPT_STATUSES:
+        raise ValidationError(
+            "cannot register samples for a %s consignment" % consignment["status"]
+        )
+    if lookup:
+        for sample in lookup("sample", "consignment_id", data.get("consignment_id")) or []:
+            if sample["data"].get("sample_no") == data.get("sample_no"):
+                raise ConflictError("duplicate sample_no: " + str(data.get("sample_no")))
+
+
+def _validate_sample_test(actor, entity, data, lookup):
+    if data.get("conclusion") not in SAMPLE_CONCLUSIONS:
+        raise ValidationError(
+            "conclusion must be one of: " + ", ".join(SAMPLE_CONCLUSIONS)
+        )
+    return {"tested_by": actor.user_id, "last_tester": actor.user_id}
+
+
+def _validate_sample_retest(actor, entity, data, lookup):
+    if data.get("retest_conclusion") not in SAMPLE_CONCLUSIONS:
+        raise ValidationError(
+            "retest_conclusion must be one of: " + ", ".join(SAMPLE_CONCLUSIONS)
+        )
+    previous = entity["data"].get("last_tester") or entity["data"].get("tester")
+    if actor.user_id == previous:
+        raise ValidationError("retest must be performed by a different tester")
+    return {"retester": actor.user_id, "last_tester": actor.user_id}
+
+
+def _validate_trace(actor, entity, data, lookup):
+    resolved = []
+    for ref in data.get("consignment_ids", []):
+        match = _find_one(lookup, "consignment", "id", ref) or _find_one(
+            lookup, "consignment", "code", ref
+        )
+        if not match:
+            raise ValidationError("unknown consignment: " + str(ref))
+        resolved.append(
+            {
+                "id": match["id"],
+                "code": match["data"].get("code"),
+                "status": match["status"],
+            }
+        )
+    return {"traced_consignments": resolved}
+
+
+def sample_effective_conclusion(sample):
+    data = sample.get("data", sample)
+    return data.get("retest_conclusion") or data.get("conclusion")
+
+
+def consignment_hold_reasons(samples):
+    reasons = []
+    for sample in samples:
+        data = sample.get("data", {})
+        label = data.get("sample_no") or sample.get("id")
+        if sample.get("status") == "pending":
+            reasons.append("sample %s pending" % label)
+        elif sample_effective_conclusion(sample) == "positive":
+            reasons.append("sample %s positive" % label)
+    return reasons
+
+
+def consignment_release_blockers(samples):
+    if not samples:
+        return ["no samples registered"]
+    blockers = list(consignment_hold_reasons(samples))
+    for sample in samples:
+        if sample.get("status") == "tested":
+            label = sample.get("data", {}).get("sample_no") or sample.get("id")
+            blockers.append("sample %s not reviewed" % label)
+    return blockers
 
 
 def trace_downstream(consignments, start_id):
@@ -43,18 +126,18 @@ def trace_downstream(consignments, start_id):
     return result
 
 
-CUSTOM_CREATE = {'consignment': _validate_consignment}
-CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
+CUSTOM_CREATE = {'consignment': _validate_consignment, 'sample': _validate_sample_create}
+CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release, ('sample', 'test'): _validate_sample_test, ('sample', 'retest'): _validate_sample_retest, ('facility', 'trace'): _validate_trace}
 
 
 class RuleEngine:
-    ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
-    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
-    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
-    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
-    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    ALIASES = {'consignments': 'consignment', 'facilities': 'facility', 'samples': 'sample'}
+    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered', 'sample': 'pending'}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('declared', 'inspected', 'pending_disposal'), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}, 'sample': {'test': (('pending',), 'tested'), 'retest': (('tested', 'reviewed'), 'reviewed')}}
+    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address'), 'sample': ('consignment_id', 'sample_no', 'sampling_point', 'tester')}
+    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): (), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',), ('sample', 'test'): ('conclusion',), ('sample', 'retest'): ('retest_conclusion',)}
+    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine'), 'sample': ('admin', 'lab', 'inspector')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine'), 'test': ('admin', 'lab'), 'retest': ('admin', 'lab')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
